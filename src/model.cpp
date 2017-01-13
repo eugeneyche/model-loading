@@ -73,8 +73,6 @@ static PosRotScale mat4_to_pos_rot_scale(const glm::mat4& mat)
     prs.rotation = glm::normalize(glm::quat_cast(norm_basis));
     glm::mat3 scale = glm::transpose(norm_basis) * basis;
     prs.scale = glm::vec3{scale[0][0], scale[1][1], scale[2][2]};
-    print_mat4(mat);
-    printf("%f %f %f\n", prs.scale.x, prs.scale.y, prs.scale.z);
     return prs;
 }
 
@@ -98,6 +96,8 @@ bool ModelManager::init()
     loc_view_ = glGetUniformLocation(program_, "view");
     loc_pose_ = glGetUniformLocation(program_, "pose");
     loc_diffuse_tex_ = glGetUniformLocation(program_, "diffuse_tex");
+
+    du_->make_n_colors(bone_colors_, 12);
     return true;
 }
 
@@ -484,27 +484,30 @@ void ModelManager::draw_skeleton(
     Pose global_pose;
     convert_local_to_global_pose(global_pose, model, pose, false);
     std::vector<VertPC> vertices;
+    size_t color_id = 0;
     for (size_t i = 0; i < model->n_bones; i++) {
         if (model->parent_ids[i] < model->n_bones) {
+            glm::vec3 color = bone_colors_[color_id++ % bone_colors_.size()];
             vertices.push_back({
                 glm::vec3{global_pose[i] * glm::vec4{0.f, 0.f, 0.f, 1.f}},
-                glm::vec3{1.f, 0.f, 0.f}
+                color
                 });
             vertices.push_back({
                 glm::vec3{global_pose[model->parent_ids[i]] *
                 glm::vec4{0.f, 0.f, 0.f, 1.f}},
-                glm::vec3{1.f, 0.f, 0.f}
+                color
                 });
         }
     }
     for (auto bone_end : model->bone_ends) {
+        glm::vec3 color = bone_colors_[color_id++ % bone_colors_.size()];
         vertices.push_back({
             glm::vec3{global_pose[bone_end.first] * glm::vec4{0.f, 0.f, 0.f, 1.f}},
-            glm::vec3{1.f, 0.f, 0.f}
+            color
             });
         vertices.push_back({
             glm::vec3{global_pose[bone_end.first] * glm::vec4{bone_end.second, 1.f}},
-            glm::vec3{1.f, 0.f, 0.f}
+            color
             });
     }
     glPointSize(5.f);

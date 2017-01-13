@@ -16,6 +16,7 @@ public:
     virtual ~DrawUtil() = default;
 
     bool init();
+    void make_n_colors(std::vector<glm::vec3>& colors, size_t n);
     void draw(
         GLenum mode,
         const glm::mat4& projection,

@@ -28,6 +28,47 @@ bool DrawUtil::init()
     return true;
 }
 
+static glm::vec3 hue_to_color(float hue)
+{
+    float h6 = hue * 6.f;
+    float offset = h6 - glm::floor(h6);
+    glm::vec3 color;
+    if (h6 < 1.f) {
+        color.r = 1.f;
+        color.g = offset;
+        color.b = 0.f;
+    } else if (h6 < 2.f) {
+        color.r = 1 - offset;
+        color.g = 1.f;
+        color.b = 0.f;
+    } else if (h6 < 3.f) {
+        color.r = 0.f;
+        color.g = 1.f;
+        color.b = offset;
+    } else if (h6 < 4.f) {
+        color.r = 0.f;
+        color.g = 1 - offset;
+        color.b = 1.f;
+    } else if (h6 < 5.f) {
+        color.r = offset;
+        color.g = 0.f;
+        color.b = 1.f;
+    } else {
+        color.r = 1.f;
+        color.g = 0.f;
+        color.b = 1 - offset;
+    }
+    return color;
+}
+
+void DrawUtil::make_n_colors(std::vector<glm::vec3>& colors, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        float hue = i / static_cast<float>(n);
+        colors.push_back(hue_to_color(hue));
+    }
+}
+
 void DrawUtil::draw(
         GLenum mode,
         const glm::mat4& projection,

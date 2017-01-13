@@ -146,6 +146,8 @@ private:
     GLint loc_pose_;
     GLint loc_diffuse_tex_;
 
+    std::vector<glm::vec3> bone_colors_;
+
     struct BoneInfo
     {
         int depth;
