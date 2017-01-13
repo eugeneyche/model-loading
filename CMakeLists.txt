@@ -20,6 +20,7 @@ include_directories(
 
 add_executable(
     ${PROJECT_NAME}
+    src/draw.cpp
     src/main.cpp
     src/image.cpp
     src/shader.cpp

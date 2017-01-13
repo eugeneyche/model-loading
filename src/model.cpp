@@ -8,7 +8,6 @@
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
-#include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
 static std::string make_prefix(int offset)
@@ -24,7 +23,7 @@ static void print_mat4(glm::mat4 mat, int offset = 0)
 {
     std::string prefix = make_prefix(offset);
     printf(
-        "%s{ %.2f, %.2f, %.2f, %.2f \n"
+        "%s{ %.2f, %.2f, %.2f, %.2f,\n"
         "%s, %.2f, %.2f, %.2f, %.2f,\n"
         "%s, %.2f, %.2f, %.2f, %.2f,\n"
         "%s, %.2f, %.2f, %.2f, %.2f}\n",
@@ -61,9 +60,28 @@ static uint8_t get_min_index(const glm::vec4& v)
     return (v[min_lhs] < v[min_rhs]) ? min_lhs : min_rhs;
 }
 
-ModelManager::ModelManager(ShaderManager* sm, ImageLoader* il)
+static PosRotScale mat4_to_pos_rot_scale(const glm::mat4& mat)
+{
+    PosRotScale prs;
+    prs.position = glm::vec3(mat[3]);
+    glm::mat3 basis = glm::mat3(mat);
+    glm::mat3 norm_basis {
+        glm::normalize(basis[0]),
+        glm::normalize(basis[1]),
+        glm::normalize(basis[2])
+    };
+    prs.rotation = glm::normalize(glm::quat_cast(norm_basis));
+    glm::mat3 scale = glm::transpose(norm_basis) * basis;
+    prs.scale = glm::vec3{scale[0][0], scale[1][1], scale[2][2]};
+    print_mat4(mat);
+    printf("%f %f %f\n", prs.scale.x, prs.scale.y, prs.scale.z);
+    return prs;
+}
+
+ModelManager::ModelManager(ShaderManager* sm, ImageLoader* il, DrawUtil* du)
   : sm_ {sm}
   , il_ {il}
+  , du_ {du}
 {
 }
 
@@ -72,28 +90,14 @@ bool ModelManager::init()
     GLuint vert, frag;
     vert = sm_->make_shader(GL_VERTEX_SHADER, "shaders/model.vert");
     frag = sm_->make_shader(GL_FRAGMENT_SHADER, "shaders/model.frag");
-    mr_program_ = sm_->make_program({vert, frag});
+    program_ = sm_->make_program({vert, frag});
     glDeleteShader(vert);
     glDeleteShader(frag);
-    mr_loc_projection_ = glGetUniformLocation(mr_program_, "projection");
-    mr_loc_view_ = glGetUniformLocation(mr_program_, "view");
-    mr_loc_pose_ = glGetUniformLocation(mr_program_, "pose");
-    mr_loc_diffuse_tex_ = glGetUniformLocation(mr_program_, "diffuse_tex");
-
-    vert = sm_->make_shader(GL_VERTEX_SHADER, "shaders/skeleton.vert");
-    frag = sm_->make_shader(GL_FRAGMENT_SHADER, "shaders/skeleton.frag");
-    skr_program_ = sm_->make_program({vert, frag});
-    glDeleteShader(vert);
-    glDeleteShader(frag);
-    glGenVertexArrays(1, &skr_vao_);
-    glGenBuffers(1, &skr_vbo_);
-
-    glBindVertexArray(skr_vao_);
-    glBindBuffer(GL_ARRAY_BUFFER, skr_vbo_);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
-    skr_loc_projection_ = glGetUniformLocation(skr_program_, "projection");
-    skr_loc_view_ = glGetUniformLocation(skr_program_, "view");
+    if (program_ == 0u) return false;
+    loc_projection_ = glGetUniformLocation(program_, "projection");
+    loc_view_ = glGetUniformLocation(program_, "view");
+    loc_pose_ = glGetUniformLocation(program_, "pose");
+    loc_diffuse_tex_ = glGetUniformLocation(program_, "diffuse_tex");
     return true;
 }
 
@@ -130,7 +134,9 @@ bool ModelManager::analyze_model(const char* path)
 
 bool ModelManager::gather_bones(
         std::set<BoneInfo>& included_bones,
+        std::vector<aiNode*>& ai_bone_ends,
         aiNode* node,
+        bool is_parent_bone,
         int depth,
         const glm::mat4& transform,
         const std::unordered_map<std::string, glm::mat4>& bone_offsets
@@ -140,14 +146,18 @@ bool ModelManager::gather_bones(
     glm::mat4 full_transform = transform * local_transform;
     bool should_include = false;
     glm::mat4 offset;
+    bool is_bone = false;
     if (bone_offsets.count(node->mName.C_Str()) > 0) {
         should_include = true;
+        is_bone = true;
         offset = bone_offsets.at(node->mName.C_Str());
     }
     for (size_t i = 0; i < node->mNumChildren; i++) {
-         if(gather_bones(
+         if (gather_bones(
                 included_bones,
+                ai_bone_ends,
                 node->mChildren[i],
+                is_bone,
                 depth + 1,
                 full_transform,
                 bone_offsets
@@ -162,6 +172,8 @@ bool ModelManager::gather_bones(
             offset
         };
         included_bones.insert(bone);
+    } else if (is_parent_bone) {
+        ai_bone_ends.push_back(node);
     }
     return should_include;
 }
@@ -190,8 +202,8 @@ void ModelManager::process_bones(Model* model, const aiScene* scene)
     }
 
     std::set<BoneInfo> included_bones;
-    gather_bones(included_bones, scene->mRootNode, 0, glm::mat4{1.f}, bone_offsets);
-    model->default_pose[0] = glm::mat4{1.f};
+    std::vector<aiNode*> ai_bone_ends;
+    gather_bones(included_bones, ai_bone_ends, scene->mRootNode, false, 0, glm::mat4{1.f}, bone_offsets);
     model->n_bones++;
     for (auto bone : included_bones) {
         uint8_t bone_id = model->n_bones++;
@@ -199,11 +211,19 @@ void ModelManager::process_bones(Model* model, const aiScene* scene)
             model->bone_mapping[bone.node->mName.C_Str()] = bone_id;
         }
         if (bone.node->mParent and model->bone_mapping.count(bone.node->mParent->mName.C_Str()) > 0) {
-            model->parent_ids[bone_id] = model->bone_mapping[bone.node->mParent->mName.C_Str()];
+            model->parent_ids[bone_id] = model->bone_mapping.at(bone.node->mParent->mName.C_Str());
         }
         model->offsets[bone_id] = bone.offset;
         model->default_pose[bone_id] = ai_to_glm_mat4(bone.node->mTransformation);
+        model->default_pose_prs[bone_id] = mat4_to_pos_rot_scale(model->default_pose[bone_id]);
     }
+    for (auto node : ai_bone_ends) {
+        glm::mat4 transform = ai_to_glm_mat4(node->mTransformation);
+        model->bone_ends.push_back({
+            model->bone_mapping.at(node->mParent->mName.C_Str()),
+            glm::vec3{transform[3]}
+            });
+    } 
 }
 
 void ModelManager::process_mesh(
@@ -323,6 +343,20 @@ bool ModelManager::load_model(Model* model, Animation* animation, const char* pa
         }
     }
 
+    Pose global_pose;
+    convert_local_to_global_pose(global_pose, model, model->default_pose, true);
+    for (size_t i = 0; i < vertices.size(); i++) {
+        const VertPNUBiBw& vert = vertices[i];
+        glm::mat4 model_transform = (
+            vert.bone_weights[0] * global_pose[vert.bone_ids[0]] + 
+            vert.bone_weights[1] * global_pose[vert.bone_ids[1]] + 
+            vert.bone_weights[2] * global_pose[vert.bone_ids[2]] + 
+            vert.bone_weights[3] * global_pose[vert.bone_ids[3]]
+            );
+        glm::vec3 global_position = glm::vec3(model_transform * glm::vec4{vertices[i].position, 1.f});
+        model->bbox.merge_in(global_position);
+    }
+
     glGenVertexArrays(1, &model->vao);
     glGenBuffers(1, &model->vbo);
     glGenBuffers(1, &model->ebo);
@@ -383,15 +417,15 @@ static T get_key_value(const std::vector<Key<T>>& keys, float time)
         size_t mid = bbegin + (bend - bbegin) / 2;
         if (keys[mid].time > time) {
             bend = mid;
-        } else if (mid < bend and keys.at(mid + 1).time < time) {
+        } else if (mid < bend and keys[mid + 1].time < time) {
             bbegin = mid + 1;
         } else {
             bbegin = mid;
             break;
         }
     }
-    float interp = (time - keys.at(bbegin).time) / (keys.at(bbegin + 1).time - keys.at(bbegin).time);
-    return glm::mix(keys.at(bbegin).value, keys.at(bbegin + 1).value, interp);
+    float interp = (time - keys[bbegin].time) / (keys[bbegin + 1].time - keys[bbegin].time);
+    return glm::mix(keys[bbegin].value, keys[bbegin + 1].value, interp);
 }
 
 void ModelManager::update_pose(Model* model, Pose& pose, Animation* animation, float time)
@@ -403,20 +437,14 @@ void ModelManager::update_pose(Model* model, Pose& pose, Animation* animation, f
     } 
     for (size_t i = 0 ; i < animation->n_channels; i++) {
         Channel& channel = animation->channels[i];
-        glm::vec3 position;
-        if (channel.position_keys.empty()) {
-            position = glm::vec3(model->default_pose[channel.bone_id][3]);
-        } else {
-            position = get_key_value(channel.position_keys, looped_time);
+        PosRotScale prs = model->default_pose_prs[channel.bone_id];
+        if (not channel.position_keys.empty()) {
+            prs.position = get_key_value(channel.position_keys, looped_time);
         }
-        glm::quat rotation;
-        if (channel.position_keys.empty()) {
-            rotation = glm::quat_cast(model->default_pose[channel.bone_id]);
-        } else {
-            rotation = get_key_value(channel.rotation_keys, looped_time);
+        if (not channel.position_keys.empty()) {
+            prs.rotation = get_key_value(channel.rotation_keys, looped_time);
         }
-        pose[channel.bone_id] = glm::mat4_cast(rotation);
-        pose[channel.bone_id][3] = glm::vec4(position, 1);
+        pose[channel.bone_id] = prs.to_mat4();
     }
 }
 
@@ -427,29 +455,20 @@ void ModelManager::draw_model(
         const glm::mat4& view
         )
 {
-    glEnable(GL_DEPTH_TEST);
-    Pose final_pose;
-    for (size_t i = 0; i < model->n_bones; i++) {
-        if (model->parent_ids[i] < model->n_bones) {
-            final_pose[i] = final_pose[model->parent_ids[i]] * pose[i];
-        } else {
-            final_pose[i] = pose[i];
-        }
-    }
-    for (size_t i = 0; i < model->n_bones; i++) {
-        final_pose[i] = final_pose[i] * model->offsets[i];
-    }
-    glUseProgram(mr_program_);
+    Pose global_pose;
+    convert_local_to_global_pose(global_pose, model, pose, true);
+
+    glUseProgram(program_);
     glBindVertexArray(model->vao);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, model->ebo);
-    glUniformMatrix4fv(mr_loc_projection_, 1, GL_FALSE, glm::value_ptr(projection));
-    glUniformMatrix4fv(mr_loc_view_, 1, GL_FALSE, glm::value_ptr(view));
-    glUniformMatrix4fv(mr_loc_pose_, model->n_bones, GL_FALSE, reinterpret_cast<const GLfloat*>(final_pose.data()));
+    glUniformMatrix4fv(loc_projection_, 1, GL_FALSE, glm::value_ptr(projection));
+    glUniformMatrix4fv(loc_view_, 1, GL_FALSE, glm::value_ptr(view));
+    glUniformMatrix4fv(loc_pose_, model->n_bones, GL_FALSE, reinterpret_cast<const GLfloat*>(global_pose.data()));
     glActiveTexture(GL_TEXTURE1);
     for (size_t i = 0; i < model->n_meshes; i++) {
         const Mesh& mesh = model->meshes[i];
         glBindTexture(GL_TEXTURE_2D, model->materials[mesh.material_h].diffuse_tex);
-        glUniform1i(mr_loc_diffuse_tex_, 1);
+        glUniform1i(loc_diffuse_tex_, 1);
         glDrawElements(GL_TRIANGLES, mesh.count, GL_UNSIGNED_INT, reinterpret_cast<GLvoid*>(sizeof(GLuint) * mesh.offset));
     }
 }
@@ -462,35 +481,49 @@ void ModelManager::draw_skeleton(
         )
 {
     glDisable(GL_DEPTH_TEST);
-    Pose final_pose;
-    std::array<bool, MAX_BONES> is_leaf;
-    std::fill(is_leaf.begin(), is_leaf.end(), true);
+    Pose global_pose;
+    convert_local_to_global_pose(global_pose, model, pose, false);
+    std::vector<VertPC> vertices;
     for (size_t i = 0; i < model->n_bones; i++) {
         if (model->parent_ids[i] < model->n_bones) {
-            is_leaf[model->parent_ids[i]] = false;
-            final_pose[i] = final_pose[model->parent_ids[i]] * pose[i];
+            vertices.push_back({
+                glm::vec3{global_pose[i] * glm::vec4{0.f, 0.f, 0.f, 1.f}},
+                glm::vec3{1.f, 0.f, 0.f}
+                });
+            vertices.push_back({
+                glm::vec3{global_pose[model->parent_ids[i]] *
+                glm::vec4{0.f, 0.f, 0.f, 1.f}},
+                glm::vec3{1.f, 0.f, 0.f}
+                });
+        }
+    }
+    for (auto bone_end : model->bone_ends) {
+        vertices.push_back({
+            glm::vec3{global_pose[bone_end.first] * glm::vec4{0.f, 0.f, 0.f, 1.f}},
+            glm::vec3{1.f, 0.f, 0.f}
+            });
+        vertices.push_back({
+            glm::vec3{global_pose[bone_end.first] * glm::vec4{bone_end.second, 1.f}},
+            glm::vec3{1.f, 0.f, 0.f}
+            });
+    }
+    glPointSize(5.f);
+    du_->draw(GL_LINES, projection, view, vertices);
+    du_->draw(GL_POINTS, projection, view, vertices);
+}
+
+void ModelManager::convert_local_to_global_pose(Pose& global_pose, const Model* model, const Pose& local_pose, bool apply_offsets)
+{
+    for (size_t i = 0; i < model->n_bones; i++) {
+        if (model->parent_ids[i] < model->n_bones) {
+            global_pose[i] = global_pose[model->parent_ids[i]] * local_pose[i];
         } else {
-            final_pose[i] = pose[i];
+            global_pose[i] = local_pose[i];
         }
     }
-    std::vector<glm::vec3> positions;
-    for (size_t i = 0; i < model->n_bones; i++) {
-        if (model->parent_ids[i] < model->n_bones) {
-            positions.push_back(glm::vec3(final_pose[i] * glm::vec4(0, 0, 0, 1)));
-            positions.push_back(glm::vec3(final_pose[model->parent_ids[i]] * glm::vec4(0, 0, 0, 1)));
-        }
-        if (is_leaf[i]) {
-            positions.push_back(glm::vec3(final_pose[i] * glm::vec4(0, 0, 0, 1)));
-            positions.push_back(glm::vec3(final_pose[i] * glm::vec4(0, 1, 0, 1)));
+    if (apply_offsets) {
+        for (size_t i = 0; i < model->n_bones; i++) {
+            global_pose[i] = global_pose[i] * model->offsets[i];
         }
     }
-    glBindVertexArray(skr_vao_);
-    glBindBuffer(GL_ARRAY_BUFFER, skr_vbo_);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(glm::vec3) * positions.size(), positions.data(), GL_DYNAMIC_DRAW);
-    glUseProgram(skr_program_);
-    glUniformMatrix4fv(skr_loc_projection_, 1, GL_FALSE, glm::value_ptr(projection));
-    glUniformMatrix4fv(skr_loc_view_, 1, GL_FALSE, glm::value_ptr(view));
-    glDrawArrays(GL_LINES, 0, positions.size());
-    glPointSize(3.f);
-    glDrawArrays(GL_POINTS, 0, positions.size());
 }
